@@ -1,0 +1,411 @@
+// comic/comic.c
+#include "comic.h"
+#include "../renderer/renderer.h"
+#include "../utils/json_parser.h"
+#include "../utils/file_io.h"
+#include "../utils/math_utils.h"
+
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define MAX_PANELS 100
+#define MAX_DIALOGUE_LENGTH 256
+#define MAX_NAME_LENGTH 32
+#define MAX_PATH_LENGTH 256
+
+// 私有结构，管理淡入动画状态
+typedef struct {
+    float timer;
+    float alpha;
+    bool fade_complete;
+} FadeState;
+
+typedef struct {
+    Texture2D* background_tex;
+    Texture2D* character_tex;
+    FadeState fade;
+} PanelData;
+
+struct Comic {
+    ComicPanel* panels;
+    int panel_count;
+    int current_panel;
+    bool is_playing;
+    
+    // 内部状态
+    PanelData* panel_data;
+    Font* font;
+    Color text_color;
+    Color name_color;
+    Rectangle dialog_rect;
+    Rectangle name_rect;
+};
+
+// 内部函数声明
+static PanelData* comic_create_panel_data(int count);
+static void comic_load_panel_textures(Comic* comic, int panel_index);
+static void comic_free_panel_textures(Comic* comic, int panel_index);
+static void comic_update_fade(FadeState* fade, ComicPanel* panel, float delta_time);
+static void comic_draw_dialog(Comic* comic, ComicPanel* panel);
+static void comic_draw_character(Comic* comic, int panel_index);
+static void comic_draw_background(Comic* comic, int panel_index);
+
+Comic* comic_load(const char* json_path) {
+    if (!json_path) return NULL;
+    
+    Comic* comic = (Comic*)calloc(1, sizeof(Comic));
+    if (!comic) return NULL;
+    
+    // 加载JSON
+    JsonNode* root = json_parse_file(json_path);
+    if (!root) {
+        printf("[COMIC] Failed to load JSON: %s\n", json_path);
+        free(comic);
+        return NULL;
+    }
+    
+    // 获取分镜数组
+    JsonNode* panels_node = json_object_get(root, "panels");
+    if (!panels_node || panels_node->type != JSON_ARRAY) {
+        printf("[COMIC] No 'panels' array found\n");
+        json_free(root);
+        free(comic);
+        return NULL;
+    }
+    
+    comic->panel_count = json_array_size(panels_node);
+    if (comic->panel_count == 0 || comic->panel_count > MAX_PANELS) {
+        printf("[COMIC] Invalid panel count: %d\n", comic->panel_count);
+        json_free(root);
+        free(comic);
+        return NULL;
+    }
+    
+    // 分配内存
+    comic->panels = (ComicPanel*)calloc(comic->panel_count, sizeof(ComicPanel));
+    comic->panel_data = comic_create_panel_data(comic->panel_count);
+    
+    if (!comic->panels || !comic->panel_data) {
+        printf("[COMIC] Memory allocation failed\n");
+        if (comic->panels) free(comic->panels);
+        if (comic->panel_data) free(comic->panel_data);
+        free(comic);
+        json_free(root);
+        return NULL;
+    }
+    
+    // 解析每个分镜
+    for (int i = 0; i < comic->panel_count; i++) {
+        JsonNode* panel_node = json_array_get(panels_node, i);
+        if (!panel_node) continue;
+        
+        ComicPanel* panel = &comic->panels[i];
+        
+        // 背景
+        JsonNode* bg_node = json_object_get(panel_node, "background");
+        if (bg_node && bg_node->type == JSON_STRING) {
+            panel->background = strdup(bg_node->string_value);
+        }
+        
+        // 人物
+        JsonNode* char_node = json_object_get(panel_node, "character");
+        if (char_node && char_node->type == JSON_STRING) {
+            panel->character = strdup(char_node->string_value);
+        }
+        
+        // 名字
+        JsonNode* name_node = json_object_get(panel_node, "name");
+        if (name_node && name_node->type == JSON_STRING) {
+            panel->name = strdup(name_node->string_value);
+        }
+        
+        // 对话
+        JsonNode* dialog_node = json_object_get(panel_node, "dialogue");
+        if (dialog_node && dialog_node->type == JSON_STRING) {
+            panel->dialogue = strdup(dialog_node->string_value);
+        }
+        
+        // 淡入时间
+        JsonNode* fade_node = json_object_get(panel_node, "fade_in");
+        if (fade_node && fade_node->type == JSON_NUMBER) {
+            panel->fade_in = (float)fade_node->number_value;
+        } else {
+            panel->fade_in = 0.5f; // 默认淡入时间
+        }
+    }
+    
+    // 初始化状态
+    comic->current_panel = 0;
+    comic->is_playing = true;
+    
+    // 加载字体和设置颜色
+    comic->font = font_load("assets/fonts/default.ttf", 24);
+    if (!comic->font) {
+        comic->font = font_get_default();
+    }
+    
+    comic->text_color = (Color){255, 255, 255, 255};  // 白色
+    comic->name_color = (Color){255, 200, 100, 255}; // 金色
+    
+    // 对话框位置
+    int width, height;
+    renderer_get_window_size(&width, &height);
+    
+    comic->dialog_rect = (Rectangle){
+        50, height - 200,  // 底部留出200像素高度
+        width - 100, 150
+    };
+    
+    comic->name_rect = (Rectangle){
+        80, height - 190,  // 名字在对话框内靠上
+        200, 40
+    };
+    
+    // 预加载第一页的纹理
+    comic_load_panel_textures(comic, 0);
+    
+    json_free(root);
+    printf("[COMIC] Loaded comic with %d panels\n", comic->panel_count);
+    return comic;
+}
+
+static PanelData* comic_create_panel_data(int count) {
+    PanelData* data = (PanelData*)calloc(count, sizeof(PanelData));
+    if (!data) return NULL;
+    
+    for (int i = 0; i < count; i++) {
+        data[i].background_tex = NULL;
+        data[i].character_tex = NULL;
+        data[i].fade.timer = 0.0f;
+        data[i].fade.alpha = 0.0f;
+        data[i].fade.fade_complete = false;
+    }
+    
+    return data;
+}
+
+static void comic_load_panel_textures(Comic* comic, int panel_index) {
+    if (!comic || panel_index < 0 || panel_index >= comic->panel_count) return;
+    
+    PanelData* data = &comic->panel_data[panel_index];
+    ComicPanel* panel = &comic->panels[panel_index];
+    
+    // 加载背景
+    if (panel->background && !data->background_tex) {
+        data->background_tex = texture_load(panel->background);
+        if (!data->background_tex) {
+            printf("[COMIC] Failed to load background: %s\n", panel->background);
+        }
+    }
+    
+    // 加载人物
+    if (panel->character && !data->character_tex) {
+        data->character_tex = texture_load(panel->character);
+        if (!data->character_tex) {
+            printf("[COMIC] Failed to load character: %s\n", panel->character);
+        }
+    }
+}
+
+static void comic_free_panel_textures(Comic* comic, int panel_index) {
+    if (!comic || panel_index < 0 || panel_index >= comic->panel_count) return;
+    
+    PanelData* data = &comic->panel_data[panel_index];
+    
+    if (data->background_tex) {
+        texture_unload(data->background_tex);
+        data->background_tex = NULL;
+    }
+    
+    if (data->character_tex) {
+        texture_unload(data->character_tex);
+        data->character_tex = NULL;
+    }
+}
+
+static void comic_update_fade(FadeState* fade, ComicPanel* panel, float delta_time) {
+    if (!fade || fade->fade_complete) return;
+    
+    fade->timer += delta_time;
+    
+    if (panel->fade_in > 0.0f) {
+        fade->alpha = clampf(fade->timer / panel->fade_in, 0.0f, 1.0f);
+        
+        if (fade->timer >= panel->fade_in) {
+            fade->alpha = 1.0f;
+            fade->fade_complete = true;
+        }
+    } else {
+        fade->alpha = 1.0f;
+        fade->fade_complete = true;
+    }
+}
+
+void comic_update(Comic* comic, float delta_time) {
+    if (!comic || !comic->is_playing) return;
+    
+    int current = comic->current_panel;
+    if (current < 0 || current >= comic->panel_count) return;
+    
+    PanelData* data = &comic->panel_data[current];
+    ComicPanel* panel = &comic->panels[current];
+    
+    // 确保纹理已加载
+    comic_load_panel_textures(comic, current);
+    
+    // 更新淡入动画
+    comic_update_fade(&data->fade, panel, delta_time);
+}
+
+static void comic_draw_background(Comic* comic, int panel_index) {
+    if (!comic) return;
+    
+    PanelData* data = &comic->panel_data[panel_index];
+    if (!data->background_tex) return;
+    
+    // 绘制背景（全屏）
+    int width, height;
+    renderer_get_window_size(&width, &height);
+    
+    texture_draw(data->background_tex, 0, 0, width, height, 
+                 (Color){255, 255, 255, 255});
+}
+
+static void comic_draw_character(Comic* comic, int panel_index) {
+    if (!comic) return;
+    
+    PanelData* data = &comic->panel_data[panel_index];
+    if (!data->character_tex) return;
+    
+    FadeState* fade = &data->fade;
+    int alpha = (int)(fade->alpha * 255);
+    
+    // 绘制人物（左侧，高度适中）
+    int width, height;
+    renderer_get_window_size(&width, &height);
+    
+    // 计算合适的人物大小
+    int char_width = width * 0.4f;
+    int char_height = height * 0.8f;
+    int char_x = 50;
+    int char_y = height - char_height - 20;
+    
+    texture_draw(data->character_tex, char_x, char_y, char_width, char_height,
+                 (Color){255, 255, 255, alpha});
+}
+
+static void comic_draw_dialog(Comic* comic, ComicPanel* panel) {
+    if (!comic || !panel || !panel->dialogue) return;
+    
+    // 绘制对话框背景
+    renderer_draw_rect(comic->dialog_rect.x, comic->dialog_rect.y,
+                      comic->dialog_rect.width, comic->dialog_rect.height,
+                      (Color){0, 0, 0, 200});  // 半透明黑色
+    
+    // 绘制名字背景
+    renderer_draw_rect(comic->name_rect.x, comic->name_rect.y,
+                      comic->name_rect.width, comic->name_rect.height,
+                      (Color){50, 30, 10, 220});  // 深棕色
+    
+    // 绘制名字
+    if (panel->name) {
+        font_draw_text(comic->font, panel->name,
+                      comic->name_rect.x + 10, comic->name_rect.y + 10,
+                      24, comic->name_color);
+    }
+    
+    // 绘制对话文本（自动换行）
+    int text_x = (int)comic->dialog_rect.x + 20;
+    int text_y = (int)comic->name_rect.y + (int)comic->name_rect.height + 10;
+    int max_width = (int)comic->dialog_rect.width - 40;
+    
+    font_draw_text_wrapped(comic->font, panel->dialogue,
+                          text_x, text_y, max_width,
+                          20, comic->text_color);
+}
+
+void comic_render(Comic* comic) {
+    if (!comic || !comic->is_playing) return;
+    
+    int current = comic->current_panel;
+    if (current < 0 || current >= comic->panel_count) return;
+    
+    ComicPanel* panel = &comic->panels[current];
+    PanelData* data = &comic->panel_data[current];
+    
+    // 1. 绘制背景
+    comic_draw_background(comic, current);
+    
+    // 2. 绘制人物（带淡入效果）
+    comic_draw_character(comic, current);
+    
+    // 3. 绘制对话框
+    if (data->fade.alpha > 0.5f) {  // 等淡入过半再显示文字
+        comic_draw_dialog(comic, panel);
+    }
+    
+    // 4. 绘制提示（下一页）
+    if (data->fade.fade_complete) {
+        int width, height;
+        renderer_get_window_size(&width, &height);
+        
+        const char* hint = "点击或按空格键继续...";
+        int text_width = font_measure_text(comic->font, hint, 18);
+        
+        font_draw_text(comic->font, hint,
+                      width - text_width - 20, height - 30,
+                      18, (Color){255, 255, 255, 180});
+    }
+}
+
+void comic_next_panel(Comic* comic) {
+    if (!comic || !comic->is_playing) return;
+    
+    int current = comic->current_panel;
+    
+    // 卸载当前纹理（可选，如果内存紧张的话）
+    // comic_free_panel_textures(comic, current);
+    
+    // 前进到下一页
+    current++;
+    
+    if (current >= comic->panel_count) {
+        // 漫剧结束
+        comic->is_playing = false;
+        printf("[COMIC] Comic finished\n");
+    } else {
+        comic->current_panel = current;
+        printf("[COMIC] Moving to panel %d/%d\n", current + 1, comic->panel_count);
+        
+        // 预加载下一页纹理
+        comic_load_panel_textures(comic, current);
+    }
+}
+
+void comic_free(Comic* comic) {
+    if (!comic) return;
+    
+    // 释放所有纹理
+    for (int i = 0; i < comic->panel_count; i++) {
+        comic_free_panel_textures(comic, i);
+        
+        // 释放字符串
+        if (comic->panels[i].background) free((void*)comic->panels[i].background);
+        if (comic->panels[i].character) free((void*)comic->panels[i].character);
+        if (comic->panels[i].name) free((void*)comic->panels[i].name);
+        if (comic->panels[i].dialogue) free((void*)comic->panels[i].dialogue);
+    }
+    
+    // 释放字体
+    if (comic->font && comic->font != font_get_default()) {
+        font_unload(comic->font);
+    }
+    
+    // 释放数组
+    if (comic->panels) free(comic->panels);
+    if (comic->panel_data) free(comic->panel_data);
+    
+    // 释放comic自身
+    free(comic);
+}
